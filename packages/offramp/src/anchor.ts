@@ -188,7 +188,7 @@ export class AnchorOffRamp implements OffRampPort {
       externalStatus: null,
       lastError: null,
       transferNotifiedAt: null,
-      pendingTransfer: null,
+      transfer: null,
       createdAt: now,
       updatedAt: now,
     });
@@ -224,7 +224,7 @@ export class AnchorOffRamp implements OffRampPort {
           status: "failed",
           lastError: reason,
           externalStatus: tx.status,
-          pendingTransfer: null,
+          transfer: null,
         });
         return {
           jobId: tx.id,
@@ -249,7 +249,7 @@ export class AnchorOffRamp implements OffRampPort {
         targetAmount: tx.amountOut || stored.targetAmount,
         status: "awaiting_transfer",
         externalStatus: tx.status,
-        pendingTransfer: transfer,
+        transfer,
       });
 
       return {
@@ -264,13 +264,13 @@ export class AnchorOffRamp implements OffRampPort {
       };
     }
 
-    if (stored.pendingTransfer) {
+    if (stored.transfer) {
       await this.state.updateJob(jobId, {
         targetAmount: tx.amountOut || stored.targetAmount,
         status: jobStatus,
         externalStatus: tx.status,
         lastError: jobStatus === "failed" ? (tx.message ?? null) : null,
-        pendingTransfer: null,
+        transfer: null,
       });
     } else {
       await this.state.updateJob(jobId, {

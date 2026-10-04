@@ -183,7 +183,14 @@ export interface OffRampJob {
   targetAmount: string;
   rate: string;
   reason?: string; // set when failed
+  /**
+   * Where the seller must send the asset, when the anchor published it only
+   * after `initiate()` (e.g. once its own KYC review finished). Set only while
+   * the anchor is waiting for that payment. Quay relays it; the seller's
+   * wallet signs.
+   */
   transfer?: WithdrawTransfer;
+  needsSellerAction?: boolean;
 }
 
 /**
@@ -367,6 +374,18 @@ export interface StoredOffRampQuote {
   sellAmount: string;
   buyCurrency: string;
   price: string;
+  /** What the seller was shown at quote time. A later `quoteId` confirm replays
+   *  these verbatim — it must never recompute them, or the job would record
+   *  figures the seller never agreed to. Absent on rows saved before they were
+   *  persisted; those cannot be confirmed by id. */
+  quotedAmounts?: {
+    /** OffRampQuote.rate — target per source, which is not always `price`. */
+    rate: string;
+    targetAmount: string;
+    feeAmount: string;
+    feeSource: "anchor" | "estimated";
+    netTargetAmount: string;
+  };
   expiresAt: number;
   createdAt: number;
 }
@@ -386,11 +405,20 @@ export interface StoredOffRampJob {
   status: OffRampJobStatus;
   externalStatus: string | null; // raw upstream status string, for debugging
   lastError: string | null;
+  /** What was sold. Kept on the job (not looked up from the quote, which the job
+   *  does not reference) so deposit instructions that arrive later can name the
+   *  asset and fall back to the quoted amount. Absent on older rows. */
+  sellAsset?: AssetRef | null;
+  sellAmount?: string | null;
+  /** Deposit instructions the anchor published after the withdraw call. */
+  transfer?: WithdrawTransfer | null;
+  lastPollError?: string | null;
+  lastPollErrorAt?: number | null;
+  lastPollReason?: string | null;
   /** When the offramp.transfer_required webhook was first sent for this job.
    *  Null means the transfer instructions haven't been surfaced yet; once set,
    *  the webhook is not re-fired on subsequent polls or restarts. */
   transferNotifiedAt: number | null;
-  pendingTransfer?: WithdrawTransfer | null;
   createdAt: number;
   updatedAt: number;
 }
@@ -402,12 +430,7 @@ export interface OffRampStateRepository {
   getJob(jobId: string): Promise<StoredOffRampJob | null>;
   updateJob(
     jobId: string,
-    patch: Partial<
-      Pick<
-        StoredOffRampJob,
-        "targetAmount" | "status" | "externalStatus" | "lastError" | "transferNotifiedAt" | "pendingTransfer"
-      >
-    >,
+    patch: Partial<Pick<StoredOffRampJob, "targetAmount" | "status" | "externalStatus" | "lastError" | "transfer" | "transferNotifiedAt" | "lastPollError" | "lastPollErrorAt" | "lastPollReason">>,
   ): Promise<void>;
 }
 
@@ -528,6 +551,16 @@ export class KycRequiredError extends Error {
   }
 }
 
+export interface KycStatusOptions {
+  /**
+   * Maximum acceptable age (ms) of a cached KYC record.
+   * If provided and the stored record's `lastSyncedAt` is within `maxAgeMs`
+   * (and its account matches `customer.account`), implementations may return
+   * the cached record without querying the anchor.
+   */
+  maxAgeMs?: number;
+}
+
 export interface KycUploadFile {
   name: string;
   blob: Blob;
@@ -537,7 +570,7 @@ export interface KycUploadFile {
 export interface KycPort {
   /** Refreshes from the anchor (if applicable) and persists the result.
    *  Throws {@link AnchorAuthRequiredError} without a live anchor session. */
-  status(customer: AnchorCustomer): Promise<KycRecord>;
+  status(customer: AnchorCustomer, opts?: KycStatusOptions): Promise<KycRecord>;
   /** Submits/updates fields. Throws {@link KycRequiredError} if a required
    *  field is still missing after merging with what's already on file. */
   submit(customer: AnchorCustomer, fields: Record<string, string>): Promise<KycRecord>;
@@ -617,6 +650,7 @@ export interface AnchorSessionRepository {
   get(sellerId: string, anchorDomain: string): Promise<AnchorSession | null>;
   save(session: AnchorSession): Promise<void>;
   delete(sellerId: string, anchorDomain: string): Promise<void>;
+  sweepExpired(now: number, graceMs: number): Promise<number>;
 }
 
 // ---------------------------------------------------------------------------

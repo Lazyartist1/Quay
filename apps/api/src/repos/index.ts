@@ -891,20 +891,26 @@ function rowToQuote(row: OffRampQuoteRow): StoredOffRampQuote {
     sellAmount: row.sellAmount,
     buyCurrency: row.buyCurrency,
     price: row.price,
+    ...(row.quotedRate !== null &&
+    row.quotedTargetAmount !== null &&
+    row.quotedFeeAmount !== null &&
+    row.quotedNetTargetAmount !== null
+      ? {
+          quotedAmounts: {
+            rate: row.quotedRate,
+            targetAmount: row.quotedTargetAmount,
+            feeAmount: row.quotedFeeAmount,
+            feeSource: row.quotedFeeSource === "anchor" ? ("anchor" as const) : ("estimated" as const),
+            netTargetAmount: row.quotedNetTargetAmount,
+          },
+        }
+      : {}),
     expiresAt: row.expiresAt,
     createdAt: row.createdAt,
   };
 }
 
 function rowToJob(row: OffRampJobRow): StoredOffRampJob {
-  let pendingTransfer: WithdrawTransfer | null = null;
-  if (row.pendingTransfer) {
-    try {
-      pendingTransfer = JSON.parse(row.pendingTransfer);
-    } catch {
-      pendingTransfer = null;
-    }
-  }
   return {
     jobId: row.jobId,
     linkId: row.linkId,
@@ -917,8 +923,13 @@ function rowToJob(row: OffRampJobRow): StoredOffRampJob {
     status: row.status as StoredOffRampJob["status"],
     externalStatus: row.externalStatus ?? null,
     lastError: row.lastError ?? null,
+    sellAsset: row.sellAssetCode ? { code: row.sellAssetCode, issuer: row.sellAssetIssuer ?? null } : null,
+    sellAmount: row.sellAmount ?? null,
+    transfer: row.transferJson ? (JSON.parse(row.transferJson) as WithdrawTransfer) : null,
+    lastPollError: row.lastPollError ?? null,
+    lastPollErrorAt: row.lastPollErrorAt ?? null,
+    lastPollReason: row.lastPollReason ?? null,
     transferNotifiedAt: row.transferNotifiedAt ?? null,
-    pendingTransfer,
     createdAt: row.createdAt,
     updatedAt: row.updatedAt,
   };
@@ -937,6 +948,11 @@ export class DrizzleOffRampStateRepository implements OffRampStateRepository {
       sellAmount: quote.sellAmount,
       buyCurrency: quote.buyCurrency,
       price: quote.price,
+      quotedRate: quote.quotedAmounts?.rate ?? null,
+      quotedTargetAmount: quote.quotedAmounts?.targetAmount ?? null,
+      quotedFeeAmount: quote.quotedAmounts?.feeAmount ?? null,
+      quotedFeeSource: quote.quotedAmounts?.feeSource ?? null,
+      quotedNetTargetAmount: quote.quotedAmounts?.netTargetAmount ?? null,
       expiresAt: quote.expiresAt,
       createdAt: quote.createdAt,
     });
@@ -960,8 +976,14 @@ export class DrizzleOffRampStateRepository implements OffRampStateRepository {
       status: job.status,
       externalStatus: job.externalStatus,
       lastError: job.lastError,
+      sellAssetCode: job.sellAsset?.code ?? null,
+      sellAssetIssuer: job.sellAsset?.issuer ?? null,
+      sellAmount: job.sellAmount ?? null,
+      transferJson: job.transfer ? JSON.stringify(job.transfer) : null,
+      lastPollError: job.lastPollError ?? null,
+      lastPollErrorAt: job.lastPollErrorAt ?? null,
+      lastPollReason: job.lastPollReason ?? null,
       transferNotifiedAt: job.transferNotifiedAt,
-      pendingTransfer: job.pendingTransfer ? JSON.stringify(job.pendingTransfer) : null,
       createdAt: job.createdAt,
       updatedAt: job.updatedAt,
     });
@@ -974,24 +996,18 @@ export class DrizzleOffRampStateRepository implements OffRampStateRepository {
 
   async updateJob(
     jobId: string,
-    patch: Partial<
-      Pick<
-        StoredOffRampJob,
-        "targetAmount" | "status" | "externalStatus" | "lastError" | "transferNotifiedAt" | "pendingTransfer"
-      >
-    >,
+    patch: Partial<Pick<StoredOffRampJob, "targetAmount" | "status" | "externalStatus" | "lastError" | "transfer" | "transferNotifiedAt" | "lastPollError" | "lastPollErrorAt" | "lastPollReason">>,
   ): Promise<void> {
-    const { pendingTransfer, ...rest } = patch;
-    const values: Record<string, unknown> = {
-      ...rest,
-      updatedAt: Date.now(),
-    };
-    if (pendingTransfer !== undefined) {
-      values.pendingTransfer = pendingTransfer ? JSON.stringify(pendingTransfer) : null;
-    }
+    const { transfer, ...columns } = patch;
     await this.db
       .update(offrampJobs)
-      .set(values)
+      .set({
+        ...columns,
+        // `undefined` leaves the stored instructions alone; only an explicit
+        // value (or null) rewrites them.
+        ...(transfer !== undefined ? { transferJson: transfer ? JSON.stringify(transfer) : null } : {}),
+        updatedAt: Date.now(),
+      })
       .where(eq(offrampJobs.jobId, jobId));
   }
 }
@@ -1091,6 +1107,13 @@ export class DrizzleKycRepository implements KycRepository {
 }
 
 /**
+ * Grace period after expiration before an anchor session row is swept at rest.
+ * A grace period of 24h keeps "your session expired" distinguishable from
+ * "never connected" for the dashboard reconnection prompt.
+ */
+export const ANCHOR_SESSION_SWEEP_GRACE_MS = 24 * 60 * 60 * 1000;
+
+/**
  * Sellers' SEP-10 sessions with the anchor. The token is a bearer credential,
  * so it is stored encrypted with the same key as webhook secrets and only
  * decrypted in-process when a call to the anchor needs it.
@@ -1135,6 +1158,21 @@ export class DrizzleAnchorSessionRepository implements AnchorSessionRepository {
     await this.db
       .delete(anchorSessions)
       .where(and(eq(anchorSessions.sellerId, sellerId), eq(anchorSessions.anchorDomain, anchorDomain)));
+  }
+
+  /**
+   * Delete anchor session rows that expired longer than graceMs ago.
+   *
+   * @param now Current timestamp in epoch ms.
+   * @param graceMs Minimum elapsed ms past expiresAt before deletion.
+   * @returns The number of deleted rows.
+   */
+  async sweepExpired(now: number, graceMs: number = ANCHOR_SESSION_SWEEP_GRACE_MS): Promise<number> {
+    const cutoff = now - graceMs;
+    const res = await this.db
+      .delete(anchorSessions)
+      .where(lt(anchorSessions.expiresAt, cutoff));
+    return res.rowsAffected ?? 0;
   }
 }
 

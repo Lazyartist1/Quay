@@ -8,6 +8,7 @@ import {
   describeError,
   type AnchorAuthView,
   type KycView,
+  type KycDisclosure,
   type PaymentLink,
   type UsdcTrustlineStatus,
 } from "../../lib/api";
@@ -19,6 +20,8 @@ import {
 } from "../../lib/anchor-session";
 import ApiKeys from "./ApiKeys";
 import KycPanel from "./KycPanel";
+import type { KycLoadState } from "../../lib/kyc-load";
+import DisclosuresPanel from "./DisclosuresPanel";
 import CashOutModal from "./CashOutModal";
 import { useSellerWallet } from "./SessionGate";
 
@@ -227,7 +230,7 @@ function LinksTable({ links, copied, onCopy, onCashOut, cashOutBlocked, anchorAu
                 <button className="linkbtn" onClick={() => onCopy(link.id)}>
                   {copied === link.id ? "Copied" : "Copy link"}
                 </button>
-                {OFFRAMP_ENABLED && link.status === "paid" && (
+                {OFFRAMP_ENABLED && (link.status === "paid" || link.status === "offramp_failed") && (
                   <>
                     {" · "}
                     {cashOutBlocked ? (
@@ -236,7 +239,7 @@ function LinksTable({ links, copied, onCopy, onCashOut, cashOutBlocked, anchorAu
                       </span>
                     ) : (
                       <button className="linkbtn" onClick={() => onCashOut(link.id)}>
-                        {CASH_OUT_LABEL}
+                        {link.status === "offramp_failed" ? "Retry cash-out" : CASH_OUT_LABEL}
                       </button>
                     )}
                   </>
@@ -267,7 +270,13 @@ export default function Dashboard() {
   const [copied, setCopied] = useState<string | null>(null);
   const [trustline, setTrustline] = useState<UsdcTrustlineStatus | null>(null);
   const [kyc, setKyc] = useState<KycView | null>(null);
+  const [disclosures, setDisclosures] = useState<KycDisclosure[]>([]);
+  const [disclosuresLoading, setDisclosuresLoading] = useState(true);
+  const [disclosuresError, setDisclosuresError] = useState<string | null>(null);
+  const [disclosureAction, setDisclosureAction] = useState<string | null>(null);
   const [anchorAuth, setAnchorAuth] = useState<AnchorAuthView | null>(null);
+  const [kycState, setKycState] = useState<KycLoadState>("idle");
+  const [kycError, setKycError] = useState<string | null>(null);
   // Which link has the cash-out modal open; null = closed (issue #32).
   const [cashOutLinkId, setCashOutLinkId] = useState<string | null>(null);
 
@@ -295,20 +304,74 @@ export default function Dashboard() {
 
   const refreshKyc = useCallback(async () => {
     if (OFFRAMP_IS_MOCK || !OFFRAMP_ENABLED) return; // no real anchor, nothing to verify
+    setKycState("loading");
+    setKycError(null);
     try {
       // KYC lives at the anchor under the seller's own account, so it can only
       // be read once the seller's wallet has signed in there.
       const session = await api.getAnchorAuth();
       setAnchorAuth(session);
-      if (session.required && !session.connected) return;
+      if (session.required && !session.connected) {
+        setKycState("ready"); // the panel shows "Connect to anchor"
+        return;
+      }
       setKyc(await api.getKyc());
+      setKycState("ready");
     } catch (e) {
       if (e instanceof CheckoutError && e.code === "anchor_auth_required") {
         setAnchorAuth((prev) => (prev ? { ...prev, connected: false } : prev));
+        setKycState("ready");
+        return;
       }
-      /* dashboard still works without it; the cash-out button just stays gated */
+      // The dashboard still works without it; the cash-out button just stays
+      // gated. Surface the failure in the panel so the seller can retry.
+      setKycError(
+        e instanceof CheckoutError ? describeError(e) : "Could not load identity verification. Please try again.",
+      );
+      setKycState("error");
     }
   }, []);
+
+  const refreshDisclosures = useCallback(async () => {
+    if (OFFRAMP_IS_MOCK || !OFFRAMP_ENABLED) return;
+    setDisclosuresLoading(true);
+    try {
+      setDisclosures(await api.getDisclosures());
+      setDisclosuresError(null);
+    } catch (e) {
+      setDisclosuresError(e instanceof CheckoutError ? describeError(e) : "Could not load disclosure history.");
+    } finally {
+      setDisclosuresLoading(false);
+    }
+  }, []);
+
+  const revokeDisclosure = useCallback(async (anchorDomain: string) => {
+    setDisclosureAction(anchorDomain);
+    setDisclosuresError(null);
+    try {
+      await api.revokeKycConsent(anchorDomain);
+      await refreshDisclosures();
+    } catch (e) {
+      setDisclosuresError(e instanceof CheckoutError ? describeError(e) : "Could not revoke consent.");
+    } finally {
+      setDisclosureAction(null);
+    }
+  }, [refreshDisclosures]);
+
+  const deleteDisclosure = useCallback(async (anchorDomain: string) => {
+    if (!window.confirm(`Ask ${anchorDomain} to delete your identity data? This also removes Quay's KYC copy for that anchor.`)) return;
+    setDisclosureAction(anchorDomain);
+    setDisclosuresError(null);
+    try {
+      await api.deleteAnchorKyc(anchorDomain);
+      await refreshDisclosures();
+      void refreshKyc();
+    } catch (e) {
+      setDisclosuresError(e instanceof CheckoutError ? describeError(e) : "Could not request deletion from the anchor.");
+    } finally {
+      setDisclosureAction(null);
+    }
+  }, [refreshDisclosures, refreshKyc]);
 
   const refreshTrustline = useCallback(async () => {
     try {
@@ -381,6 +444,10 @@ export default function Dashboard() {
   useEffect(() => {
     void refreshKyc();
   }, [refreshKyc]);
+
+  useEffect(() => {
+    void refreshDisclosures();
+  }, [refreshDisclosures]);
 
   async function create() {
     setActionError(null);
@@ -563,7 +630,22 @@ export default function Dashboard() {
       </section>
 
       {OFFRAMP_ENABLED && !OFFRAMP_IS_MOCK && (
-        <KycPanel kyc={kyc} anchor={anchorAuth} onUpdated={setKyc} onAnchorConnected={() => void refreshKyc()} />
+        <>
+          <KycPanel
+            kyc={kyc}
+            anchor={anchorAuth}
+            loadState={kycState}
+            loadError={kycError}
+            onRetry={() => void refreshKyc()}
+            onUpdated={(updated) => { setKyc(updated); void refreshDisclosures(); }}
+            onAnchorConnected={() => void refreshKyc()}
+          />
+          <DisclosuresPanel disclosures={disclosures} loading={disclosuresLoading} error={disclosuresError}
+            deletableAnchorDomain={anchorAuth?.connected ? anchorAuth.anchor : null}
+            onRetry={() => void refreshDisclosures()}
+            onRevoke={disclosureAction ? undefined : (domain) => void revokeDisclosure(domain)}
+            onAskDelete={disclosureAction ? undefined : (domain) => void deleteDisclosure(domain)} />
+        </>
       )}
 
       <section className="panel">

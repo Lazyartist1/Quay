@@ -3,6 +3,7 @@ import {
   type AnchorCustomer,
   type KycFieldSpec,
   type KycPort,
+  type KycStatusOptions,
   type KycRecord,
   type KycRepository,
   type ProvidedFieldStatus,
@@ -64,14 +65,37 @@ export class TestAnchorKyc implements KycPort {
     this.profileRepo = opts.profileRepo;
   }
 
-  async status(customer: AnchorCustomer): Promise<KycRecord> {
+  async status(customer: AnchorCustomer, opts: KycStatusOptions = {}): Promise<KycRecord> {
     const existing = await this.repo.get(customer.sellerId, this.auth.anchorDomain);
+
+    if (
+      opts.maxAgeMs !== undefined &&
+      opts.maxAgeMs > 0 &&
+      existing &&
+      existing.account === customer.account &&
+      existing.lastSyncedAt !== null
+    ) {
+      const now = Date.now();
+      const effectiveMaxAge =
+        existing.status === "PROCESSING"
+          ? Math.min(opts.maxAgeMs, 15_000)
+          : opts.maxAgeMs;
+
+      if (now - existing.lastSyncedAt <= effectiveMaxAge) {
+        return existing;
+      }
+    }
+
     const jwt = await this.auth.token(customer);
     const { kycServer } = await this.discovery.get();
     const remote = await getSep12Customer(kycServer, jwt, {
       account: customer.account,
       customerId: reusableCustomerId(existing, customer, this.auth.anchorDomain),
     });
+
+    if (remote.staleCustomerId) {
+      console.warn(JSON.stringify({ event: "kyc.customer_id.stale", sellerId: customer.sellerId }));
+    }
 
     const cleanProvided = stripBinaryFields(existing?.providedFields ?? {}, remote.requiredFields);
     const record: KycRecord = {
@@ -100,6 +124,10 @@ export class TestAnchorKyc implements KycPort {
       account: customer.account,
       customerId: reusableCustomerId(existing, customer, this.auth.anchorDomain),
     });
+
+    if (discovery.staleCustomerId) {
+      console.warn(JSON.stringify({ event: "kyc.customer_id.stale", sellerId: customer.sellerId }));
+    }
 
     // Get the reusable profile for this seller
     const profile = await this.profileRepo.get(customer.sellerId);
@@ -243,7 +271,7 @@ function reusableCustomerId(
 /** `OFFRAMP=mock` has no real anchor and nothing to be compliant with — never
  *  gates the (simulated) cash-out path. */
 export class NoKycRequired implements KycPort {
-  async status(customer: AnchorCustomer): Promise<KycRecord> {
+  async status(customer: AnchorCustomer, _opts?: { maxAgeMs?: number }): Promise<KycRecord> {
     return this.accepted(customer);
   }
 
@@ -272,4 +300,3 @@ export class NoKycRequired implements KycPort {
     };
   }
 }
-

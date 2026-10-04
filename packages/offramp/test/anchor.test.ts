@@ -67,7 +67,7 @@ describe("AnchorOffRamp (offline)", () => {
       status: "pending",
       externalStatus: null,
       lastError: null,
-      pendingTransfer: null,
+      transfer: null,
       createdAt: Date.now(),
       updatedAt: Date.now(),
     });
@@ -104,9 +104,9 @@ describe("AnchorOffRamp (offline)", () => {
     expect(status1.transfer?.memo).toBe("memo-test-123");
     expect(status1.transfer?.memoType).toBe("text");
 
-    // Check state has pendingTransfer persisted
+    // Check state has transfer persisted
     const storedJob = await state.getJob("job-1");
-    expect(storedJob?.pendingTransfer).toEqual(status1.transfer);
+    expect(storedJob?.transfer).toEqual(status1.transfer);
 
     // Create a brand new adapter instance with same state (simulating restart)
     const freshOfframp = new AnchorOffRamp({
@@ -148,7 +148,7 @@ describe("AnchorOffRamp (offline)", () => {
       status: "pending",
       externalStatus: null,
       lastError: null,
-      pendingTransfer: null,
+      transfer: null,
       createdAt: Date.now(),
       updatedAt: Date.now(),
     });
@@ -179,7 +179,7 @@ describe("AnchorOffRamp (offline)", () => {
 
     const job = await state.getJob("job-over");
     expect(job?.status).toBe("failed");
-    expect(job?.pendingTransfer).toBeNull();
+    expect(job?.transfer).toBeNull();
   });
 
   it("fails the job if amount_in is missing in pending_user_transfer_start", async () => {
@@ -212,7 +212,7 @@ describe("AnchorOffRamp (offline)", () => {
       status: "pending",
       externalStatus: null,
       lastError: null,
-      pendingTransfer: null,
+      transfer: null,
       createdAt: Date.now(),
       updatedAt: Date.now(),
     });
@@ -231,7 +231,7 @@ describe("AnchorOffRamp (offline)", () => {
     expect(status.reason).toContain("Missing amount_in");
   });
 
-  it("clears pendingTransfer once status advances past pending_user_transfer_start", async () => {
+  it("clears transfer once status advances past pending_user_transfer_start", async () => {
     const state = new FakeOffRampStateRepository();
     const sellerKeypair = Keypair.random();
     const offramp = new AnchorOffRamp({
@@ -250,7 +250,7 @@ describe("AnchorOffRamp (offline)", () => {
       status: "pending",
       externalStatus: "pending_user_transfer_start",
       lastError: null,
-      pendingTransfer: {
+      transfer: {
         destination: "GANCHORACCOUNT",
         amount: "100.00",
         asset: { code: "USDC", issuer: null },
@@ -272,11 +272,11 @@ describe("AnchorOffRamp (offline)", () => {
     expect(status.transfer).toBeUndefined();
 
     const job = await state.getJob("job-adv");
-    expect(job?.pendingTransfer).toBeNull();
+    expect(job?.transfer).toBeNull();
   });
   // ---- fail-closed: the transfer is what the seller's wallet will be asked to send -----------------
 
-  async function pendingTransferSetup(opts: { quote: boolean }) {
+  async function transferSetup(opts: { quote: boolean }) {
     const state = new FakeOffRampStateRepository();
     const offramp = new AnchorOffRamp({
       homeDomain: "testanchor.stellar.org",
@@ -308,7 +308,7 @@ describe("AnchorOffRamp (offline)", () => {
       externalStatus: null,
       lastError: null,
       transferNotifiedAt: null,
-      pendingTransfer: null,
+      transfer: null,
       createdAt: Date.now(),
       updatedAt: Date.now(),
     });
@@ -326,7 +326,7 @@ describe("AnchorOffRamp (offline)", () => {
   });
 
   it("refuses to offer a transfer when the stored quote is gone, instead of guessing the asset", async () => {
-    const { state, offramp } = await pendingTransferSetup({ quote: false });
+    const { state, offramp } = await transferSetup({ quote: false });
     vi.spyOn(offramp["sep24"], "getTransaction").mockResolvedValue(tx());
 
     const status = await offramp.status("job-x");
@@ -334,11 +334,11 @@ describe("AnchorOffRamp (offline)", () => {
     expect(status.status).toBe("failed");
     expect(status.transfer).toBeUndefined();
     expect(status.reason).toContain("No stored quote");
-    expect((await state.getJob("job-x"))?.pendingTransfer).toBeNull();
+    expect((await state.getJob("job-x"))?.transfer).toBeNull();
   });
 
   it.each([["not-a-number"], ["0"], ["-5"], [""]])("refuses an unusable amount_in (%j)", async (amountIn) => {
-    const { offramp } = await pendingTransferSetup({ quote: true });
+    const { offramp } = await transferSetup({ quote: true });
     vi.spyOn(offramp["sep24"], "getTransaction").mockResolvedValue(tx({ amountIn }));
 
     const status = await offramp.status("job-x");
@@ -349,7 +349,7 @@ describe("AnchorOffRamp (offline)", () => {
   });
 
   it("refuses a memo type the wallet cannot build", async () => {
-    const { offramp } = await pendingTransferSetup({ quote: true });
+    const { offramp } = await transferSetup({ quote: true });
     vi.spyOn(offramp["sep24"], "getTransaction").mockResolvedValue(tx({ withdrawMemoType: "weird" }));
 
     const status = await offramp.status("job-x");
@@ -360,7 +360,7 @@ describe("AnchorOffRamp (offline)", () => {
   });
 
   it("passes a valid id memo through exactly, and always pays the asset that was quoted", async () => {
-    const { offramp } = await pendingTransferSetup({ quote: true });
+    const { offramp } = await transferSetup({ quote: true });
     vi.spyOn(offramp["sep24"], "getTransaction").mockResolvedValue(
       tx({ withdrawMemo: "12345", withdrawMemoType: "id" }),
     );
